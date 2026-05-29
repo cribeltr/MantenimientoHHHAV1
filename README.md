@@ -14,13 +14,16 @@ partir del libro Excel `Programacion_MP_2026.xlsm`.
 
 ## Vistas
 
-El archivo HTML incluye **dos vistas** seleccionables por pestañas, ambas con
-**idénticas funcionalidades**:
+El archivo HTML incluye **tres vistas** seleccionables por pestañas:
 
 1. **Registro MP 2026** — Hoja `Registro_MP-2026`, columnas **B a AQ**, filas 8 a 973.
    Cada mes tiene dos subcolumnas: **P** (programado) y **R** (realizado).
 2. **PMP 2026 · Carta Gantt** — Hoja `PMP_2026`, con la familia de equipo (`Fam`),
    los 12 meses y el resumen `PMP` / `MP-R` / `MP-RA`.
+3. **📋 Pendientes** — Vista agregada con *todos* los pendientes de todos los equipos
+   (a partir del historial), con los mismos filtros, ordenamiento y exportación.
+
+Las vistas 1 y 2 comparten **idénticas funcionalidades** de tabla.
 
 ## Funcionalidades (en ambas vistas)
 
@@ -33,6 +36,28 @@ El archivo HTML incluye **dos vistas** seleccionables por pestañas, ambas con
 - 🎨 **Coloreado de estados** con leyenda (X, R, PM, RA, Si, Si-RA, C1–C8, FS, Baja, No, NU).
 - 📌 **Encabezado y primeras columnas fijas** (ID / N° Carpeta / Fam) al desplazar.
 - ⬇ **Exportar CSV** del resultado filtrado.
+
+## Historial por equipo (eventos · pendientes · tareas)
+
+En cada fila, el botón **📋** (en la columna ID) abre un **panel lateral** con el
+historial del equipo. La jerarquía es:
+
+```
+Equipo
+└─ Evento            (fecha · tipo · qué ocurrió)
+   └─ Pendiente      (título · estado · responsable · fecha límite)
+      └─ Tarea/Gestión (tipo · descripción · estado · nota)
+```
+
+- Crear / editar / eliminar en los tres niveles; marcar tareas como hechas.
+- El botón 📋 muestra un **contador** de pendientes abiertos y se pone **rojo si hay vencidos**.
+- Filtro de barra **"Con pendientes abiertos / vencidos"** y pestaña **Pendientes** agregada.
+- **Persistencia local**: se guarda en el navegador (`localStorage`). Con **⬇ Historial**
+  descargas un respaldo `.json` y con **⬆ Importar** lo restauras o lo llevas a otro equipo.
+
+> Como el historial se guarda en el navegador, al **regenerar el HTML desde el Excel**
+> los datos se conservan (es una capa independiente de la tabla). Para compartirlo entre
+> personas/computadores, usa Exportar/Importar el respaldo JSON.
 
 ## Regenerar el HTML
 
