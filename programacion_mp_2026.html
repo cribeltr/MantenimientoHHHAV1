@@ -183,10 +183,16 @@
 <div class="tabs" id="tabs"></div>
 <div class="toolbar">
   <input type="search" id="globalSearch" placeholder="🔍 Buscar en todas las columnas...">
-  <select id="histFilter" title="Filtrar por estado de pendientes">
+  <select id="histFilter" title="Filtrar por pendientes o estado del equipo">
     <option value="all">📋 Pendientes: todos</option>
     <option value="open">Con pendientes abiertos</option>
     <option value="overdue">Con pendientes vencidos</option>
+    <optgroup label="Estado del equipo">
+      <option value="est:operativo">Operativo</option>
+      <option value="est:no operativo">No operativo</option>
+      <option value="est:en servicio técnico">En servicio técnico</option>
+      <option value="est:baja">Baja</option>
+    </optgroup>
   </select>
   <button class="btn" id="clearFilters">✕ Limpiar filtros</button>
   <button class="btn primary" id="exportCsv">⬇ Exportar CSV</button>
@@ -234,7 +240,9 @@ const LEGEND = [
   ["sw-pm","PM – Pendiente mes"],["sw-ra","RA – Realizado anticipado"],
   ["sw-si","Si – Realizada"],["sw-sira","Si-RA – Realizada (reprog.)"],
   ["sw-causa","C1–C8 – Causa reprogramación"],["sw-fs","FS – Fuera de servicio"],
-  ["sw-baja","Baja"],["sw-no","No realizada"],["sw-nu","NU – No utilizado"]
+  ["sw-baja","Baja"],["sw-no","No realizada"],["sw-nu","NU – No utilizado"],
+  ["est-operativo","● Equipo operativo"],["est-nooperativo","● No operativo"],
+  ["est-servicio","● En servicio técnico"],["est-baja","● Baja"]
 ];
 
 /* ---------- estado global ---------- */
@@ -301,28 +309,35 @@ function renderTable(){
 
   // TBODY
   const rowsHtml = v.rows.map((row,ri) => {
+    const eqId = isEq ? String(row[v.idCol]) : "";
+    const red = isEq ? reduceEquipo(eqId) : null;   // estado + overlay R (mes sig.)
     let tds = "";
     cols.forEach((c,idx) => {
-      const val = row[idx] ?? "";
-      let cls = "", inner;
+      let value = row[idx] ?? "";
+      let cls = "", inner, ovl = false;
       if(c.type === "status"){
-        const sc = statusClass(val); cls = "st" + (sc?(" "+sc):"") + (isEq?" mes":"");
-        inner = esc(val);
+        // overlay "R" generado por evento (C1–C8) si la celda del mes está vacía
+        if(red && v.overlayCol && v.overlayCol[idx]!=null && value==="" && red.progR.has(v.overlayCol[idx])){ value="R"; ovl=true; }
+        const sc = statusClass(value); cls = "st" + (sc?(" "+sc):"") + (isEq?" mes":"") + (ovl?" ovl":"");
+        inner = esc(value);
       }else{
-        inner = `<div class='cell' title="${esc(val)}">${esc(val)}</div>`;
+        inner = `<div class='cell' title="${esc(value)}">${esc(value)}</div>`;
       }
-      // botón de historial en la columna ID (solo vistas de equipos)
-      if(isEq && idx === v.idCol){ inner = histBtnHtml(val) + inner; }
+      // botón de historial + estado en la columna ID (solo vistas de equipos)
+      if(isEq && idx === v.idCol){ inner = histBtnHtml(value, red) + inner; }
       let style = "";
       if(idx < sticky){ cls += (cls?" ":"") + "sticky"; style = leftStyle(cols,idx,sticky); }
-      tds += `<td class='${cls}' style='${style}'>${inner}</td>`;
+      const ttl = ovl ? ` title="Reprogramado por evento de MP"` : "";
+      tds += `<td class='${cls}' style='${style}'${ttl}>${inner}</td>`;
     });
     // en la vista Pendientes la fila completa abre el historial del equipo
     const clk = (v.action===false) ? " class='clickrow'" : "";
     return `<tr data-ri='${ri}'${clk}>${tds}</tr>`;
   }).join("");
 
+  const _sl = boxEl.scrollLeft, _st = boxEl.scrollTop;     // conservar scroll
   boxEl.innerHTML = `<table>${thead}<tbody>${rowsHtml}</tbody></table>`;
+  boxEl.scrollLeft = _sl; boxEl.scrollTop = _st;
   applyFilters();
 }
 
@@ -379,11 +394,12 @@ function applyFilters(){
     for(const [idx,set] of fEntries){
       if(!set.has(row[idx] ?? "")){ ok = false; break; }
     }
-    // filtro por estado de pendientes (solo vistas de equipos)
+    // filtro por estado de pendientes o estado del equipo (solo vistas de equipos)
     if(ok && isEq && hf !== "all"){
-      const ps = pendStats(String(row[v.idCol]));
-      if(hf === "open" && ps.open <= 0) ok = false;
-      else if(hf === "overdue" && !ps.overdue) ok = false;
+      const id = String(row[v.idCol]);
+      if(hf === "open"){ if(pendStats(id).open <= 0) ok = false; }
+      else if(hf === "overdue"){ if(!pendStats(id).overdue) ok = false; }
+      else if(hf.startsWith("est:")){ if(equipoEstado(id) !== hf.slice(4)) ok = false; }
     }
     // búsqueda global
     if(ok && search){
@@ -538,54 +554,127 @@ function exportCsv(){
 }
 
 /* ===================================================================
-   HISTORIAL POR EQUIPO  (eventos -> pendientes -> tareas/gestiones)
-   Persistencia: localStorage + respaldo JSON. Indexado por ID de equipo.
+   MOTOR DE EVENTOS POR EQUIPO
+   7 tipos de evento -> estado del equipo + ciclos correctivos (Folio SIGEM).
+   El estado y los ciclos se DERIVAN del registro de eventos (la anulación
+   recalcula todo). Pendientes a nivel de equipo (auto + manuales) con tareas.
+   Persistencia: localStorage + respaldo JSON.
    =================================================================== */
-const HKEY = "mp2026_historial_v1";
+const HKEY = "mp2026_historial_v2";
 let HIST = {};
 let CURRENT_EQ = null;        // equipo abierto en el panel
-let editing = null;           // formulario abierto: {kind,mode,evId,pId,tId}
-const TIPOS_EVENTO = ["Falla","Mantención correctiva","Mantención preventiva",
-                      "Inspección","Reprogramación","Observación","Otro"];
+let editing = null;           // formulario abierto
 let REG_COL = {}, REG_BY_ID = {};
+const MESES_AB = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+
+const ETIPOS = ["Solicitud de trabajo","Visita técnica","Orden de Compra",
+  "Envío a servicio técnico","Recepción","Reparación","Mantención preventiva"];
+const MP_RESULT = ["Si","C1","C2","C3","C4","C5","C6","C7","C8","FS","Baja","NU","No"];
+const MP_RESULT_TXT = {
+  "Si":"MP realizada","C1":"Imposibilidad de desocupar el equipo","C2":"En servicio técnico",
+  "C3":"No operativo, espera de repuestos","C4":"En préstamo a otro hospital",
+  "C5":"No disponibilidad HH SEC","C6":"No disponibilidad ST externo",
+  "C7":"Ausencia funcionario SEC > 15 días","C8":"Contingencia hospitalaria",
+  "FS":"Fuera de servicio","Baja":"Equipo dado de baja","NU":"No ubicable","No":"No realizada"
+};
+const ESTADOS = ["operativo","no operativo","en servicio técnico","baja"];
+function mpEstado(code){
+  if(code==="Si") return "operativo";
+  if(code==="C2") return "en servicio técnico";
+  if(code==="C3"||code==="FS"||code==="NU") return "no operativo";
+  if(code==="Baja") return "baja";
+  return null;   // C1, C4-C8, No -> sin cambio
+}
+function mapEstadoLabel(l){ return {"Operativo":"operativo","No operativo":"no operativo",
+  "En servicio técnico":"en servicio técnico"}[l] || l; }
+function estCls(e){ return {"operativo":"est-operativo","no operativo":"est-nooperativo",
+  "en servicio técnico":"est-servicio","baja":"est-baja"}[e] || "est-operativo"; }
 
 function todayStr(){ const d=new Date(); return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10); }
 function uid(){ return "x"+Math.random().toString(36).slice(2,9)+Date.now().toString(36).slice(-4); }
+function monthIdx(f){ const m=/^\d{4}-(\d{2})/.exec(f||""); return m?(+m[1]-1):new Date().getMonth(); }
+function eqIds(){ return Object.keys(HIST).filter(k=>!k.startsWith("__")); }
 
-function loadHist(){ try{ HIST = JSON.parse(localStorage.getItem(HKEY) || "{}") || {}; }catch(e){ HIST = {}; } }
+function loadHist(){
+  try{ HIST = JSON.parse(localStorage.getItem(HKEY) || "{}") || {}; }catch(e){ HIST = {}; }
+  // migración v1 (pendientes anidados bajo eventos) -> v2 (pendientes por equipo)
+  try{
+    const old = JSON.parse(localStorage.getItem("mp2026_historial_v1") || "null");
+    if(old && !eqIds().length){
+      for(const id in old){ const e=old[id]||{}; HIST[id]={eventos:e.eventos||[],pendientes:e.pendientes||[]};
+        (HIST[id].eventos||[]).forEach(ev=>{ if(ev.pendientes){ ev.pendientes.forEach(p=>{p.originEvId=ev.id;HIST[id].pendientes.push(p);}); delete ev.pendientes; } }); }
+    }
+  }catch(e){}
+  eqIds().forEach(id=>{ HIST[id].eventos=HIST[id].eventos||[]; HIST[id].pendientes=HIST[id].pendientes||[]; });
+}
 function saveHist(){
   try{ localStorage.setItem(HKEY, JSON.stringify(HIST)); }
-  catch(e){ alert("No se pudo guardar el historial (almacenamiento lleno o bloqueado). Usa «⬇ Historial» para respaldar."); }
+  catch(e){ alert("No se pudo guardar (almacenamiento lleno o bloqueado). Usa «⬇ Historial» para respaldar."); }
   afterChange();
 }
 function afterChange(){
   refreshBadges();
-  if(CURRENT === "pendientes"){ rebuildPendientes(); renderTable(); }
+  renderTable();              // refresca overlays/estado/pendientes (conserva scroll)
+  if(CURRENT_EQ) renderDrawer();
 }
-function getHist(id){ return HIST[id] || {eventos:[]}; }            // solo lectura
-function ensureEq(id){ if(!HIST[id]) HIST[id] = {eventos:[]}; return HIST[id]; }  // mutable
+function getHist(id){ const h=HIST[id]||{eventos:[],pendientes:[]}; h.eventos=h.eventos||[]; h.pendientes=h.pendientes||[]; return h; }
+function ensureEq(id){ if(!HIST[id]) HIST[id]={eventos:[],pendientes:[]};
+  HIST[id].eventos=HIST[id].eventos||[]; HIST[id].pendientes=HIST[id].pendientes||[]; return HIST[id]; }
+
+/* ---- REDUCER: estado actual, ciclos SIGEM abiertos y overlay R (mes sig.) ---- */
+function reduceEquipo(id){
+  const h = HIST[id]; let estado="operativo"; const open=new Map(); const progR=new Set();
+  if(h && h.eventos && h.eventos.length){
+    const evs = h.eventos.filter(e=>!e.anulado).slice().sort((a,b)=>
+      (a.fecha||"").localeCompare(b.fecha||"") || (a.seq||0)-(b.seq||0));
+    for(const e of evs){
+      switch(e.tipo){
+        case "Solicitud de trabajo":
+          estado="no operativo"; if(e.folio) open.set(e.folio,{folio:e.folio,fecha:e.fecha}); break;
+        case "Visita técnica":
+          estado=mapEstadoLabel(e.estadoResultante)||estado;
+          if(e.tipoVisita==="Correctiva" && mapEstadoLabel(e.estadoResultante)==="operativo" && e.folio) open.delete(e.folio);
+          break;
+        case "Orden de Compra": break;
+        case "Envío a servicio técnico": estado="en servicio técnico"; break;
+        case "Recepción":
+          estado=mapEstadoLabel(e.estadoResultante)||estado;
+          if(mapEstadoLabel(e.estadoResultante)==="operativo" && e.folio) open.delete(e.folio); break;
+        case "Reparación":
+          estado=mapEstadoLabel(e.estadoResultante)||estado;
+          if(mapEstadoLabel(e.estadoResultante)==="operativo" && e.folio) open.delete(e.folio); break;
+        case "Mantención preventiva": {
+          const ne=mpEstado(e.resultado); if(ne) estado=ne;
+          if(/^C[1-8]$/.test(e.resultado||"")) progR.add((monthIdx(e.fecha)+1)%12);
+          break;
+        }
+      }
+    }
+  }
+  return {estado, open, progR};
+}
+function equipoEstado(id){ return reduceEquipo(String(id)).estado; }
+function openCycles(id){ return [...reduceEquipo(String(id)).open.values()]; }
 
 function pendStats(id){
-  const h = HIST[id]; let open=0, total=0, overdue=false;
-  if(h) for(const ev of (h.eventos||[])) for(const p of (ev.pendientes||[])){
-    total++;
-    if(p.estado !== "cerrado"){ open++; if(p.fechaLimite && p.fechaLimite < todayStr()) overdue=true; }
-  }
-  return {open, total, overdue, eventos: h ? (h.eventos||[]).length : 0};
+  const h=HIST[id]; let open=0,total=0,overdue=false;
+  if(h) for(const p of (h.pendientes||[])){ if(p.anulado) continue; total++;
+    if(p.estado!=="cerrado"){ open++; if(p.fechaLimite && p.fechaLimite<todayStr()) overdue=true; } }
+  return {open,total,overdue};
 }
 
-function histBtnHtml(val){
-  const id = String(val);
-  const ps = pendStats(id);
+function histBtnHtml(value, red){
+  const id=String(value); const ps=pendStats(id);
+  const est=(red?red.estado:equipoEstado(id));
   const cls = ps.overdue ? "ovd" : (ps.open>0 ? "has" : "");
-  return `<button class="hbtn ${cls}" data-eq="${esc(id)}" title="Historial / pendientes del equipo">📋<span class="hb">${ps.open>0?ps.open:""}</span></button>`;
+  const dot = est!=="operativo" ? `<span class="estdot ${estCls(est)}" title="${esc(est)}"></span>` : "";
+  return `<button class="hbtn ${cls}" data-eq="${esc(id)}" title="Historial · estado: ${esc(est)}">📋<span class="hb">${ps.open>0?ps.open:""}</span></button>${dot}`;
 }
 function refreshBadges(){
   document.querySelectorAll(".hbtn").forEach(b=>{
-    const ps = pendStats(b.dataset.eq);
-    b.classList.toggle("has", ps.open>0 && !ps.overdue);
-    b.classList.toggle("ovd", ps.overdue);
-    const s = b.querySelector(".hb"); if(s) s.textContent = ps.open>0 ? ps.open : "";
+    const ps=pendStats(b.dataset.eq);
+    b.classList.toggle("has", ps.open>0 && !ps.overdue); b.classList.toggle("ovd", ps.overdue);
+    const s=b.querySelector(".hb"); if(s) s.textContent=ps.open>0?ps.open:"";
   });
 }
 
@@ -606,10 +695,15 @@ function syncToolbar(){
 /* ---- metadatos de vistas + vista agregada "Pendientes" ---- */
 function computeMeta(){
   ["registro","pmp"].forEach(k=>{
-    const v = DATA[k];
-    v.action = true;
-    v.unit = "equipos";
+    const v = DATA[k]; v.action=true; v.unit="equipos";
     v.idCol = v.columns.findIndex(c => !c.group && String(c.label).trim()==="ID");
+    // mapa colIndex -> mesIndex para overlay "R" (Registro: 2ª de cada par P/R; PMP: cada mes)
+    v.overlayCol = {}; let s=0;
+    v.columns.forEach((c,i)=>{ if(c.type==="status"){
+      if(k==="registro"){ if(s%2===1) v.overlayCol[i]=Math.floor(s/2); }
+      else { v.overlayCol[i]=s; }
+      s++;
+    }});
   });
   const idc = DATA.registro.idCol;
   DATA.registro.columns.forEach((c,i)=>{ if(!c.group) REG_COL[String(c.label).trim()] = i; });
@@ -619,13 +713,13 @@ function computeMeta(){
     id:"pendientes", title:"📋 Pendientes", action:false, idCol:-1, stickyCols:1, unit:"pendientes",
     columns:[
       {label:"Equipo",group:null,type:"text"},
-      {label:"Fecha evento",group:null,type:"text"},
-      {label:"Tipo evento",group:null,type:"text"},
       {label:"Pendiente",group:null,type:"text"},
+      {label:"Tipo",group:null,type:"text"},
       {label:"Estado",group:null,type:"status"},
       {label:"Responsable",group:null,type:"text"},
       {label:"Fecha límite",group:null,type:"text"},
-      {label:"Tareas",group:null,type:"text"}
+      {label:"Tareas",group:null,type:"text"},
+      {label:"Folio SIGEM",group:null,type:"text"}
     ],
     rows:[], _eq:[]
   };
@@ -634,19 +728,17 @@ function computeMeta(){
 
 function rebuildPendientes(){
   const v = DATA.pendientes; v.rows = []; v._eq = [];
-  Object.keys(HIST).forEach(id=>{
+  eqIds().forEach(id=>{
     const info = getEquipoInfo(id);
-    (HIST[id].eventos||[]).forEach(ev=>{
-      (ev.pendientes||[]).forEach(p=>{
-        const ts = p.tareas||[];
-        const hechas = ts.filter(t=>t.estado==="hecha").length;
-        const ovd = p.estado!=="cerrado" && p.fechaLimite && p.fechaLimite < todayStr();
-        v.rows.push([
-          `#${id} ${info.equipo||""}`.trim(), ev.fecha||"", ev.tipo||"", p.titulo||"",
-          p.estado||"", p.responsable||"", (p.fechaLimite||"") + (ovd?" ⚠":""), `${hechas}/${ts.length}`
-        ]);
-        v._eq.push(String(id));
-      });
+    (HIST[id].pendientes||[]).forEach(p=>{
+      if(p.anulado) return;
+      const ts = p.tareas||[]; const hechas = ts.filter(t=>t.estado==="hecha").length;
+      const ovd = p.estado!=="cerrado" && p.fechaLimite && p.fechaLimite < todayStr();
+      v.rows.push([
+        `#${id} ${info.equipo||""}`.trim(), p.titulo||"", p.tipo||"", p.estado||"",
+        p.responsable||"", (p.fechaLimite||"") + (ovd?" ⚠":""), `${hechas}/${ts.length}`, p.folio||""
+      ]);
+      v._eq.push(String(id));
     });
   });
 }
@@ -660,129 +752,239 @@ function closeDrawer(){ $("#overlay").classList.remove("show"); $("#drawer").cla
 function estadoChip(e){ const m={"abierto":"abierto","en proceso":"proceso","cerrado":"cerrado"};
   return `<span class="chip ${m[e]||"abierto"}">${esc(e||"abierto")}</span>`; }
 function tipoChip(t){ return `<span class="chip ${t==="gestion"?"gestion":"tarea"}">${t==="gestion"?"Gestión":"Tarea"}</span>`; }
-function optList(arr,sel){ return arr.map(o=>`<option ${o===sel?"selected":""}>${esc(o)}</option>`).join(""); }
+function fLab(t){ return `<label>${esc(t)}</label>`; }
+function fIn(id,v,ph,type){ return `<input id="${id}" type="${type||"text"}" value="${esc(v||"")}" placeholder="${esc(ph||"")}">`; }
+function fSel(id,opts,sel){ return `<select id="${id}">${opts.map(o=>`<option ${o===sel?"selected":""}>${esc(o)}</option>`).join("")}</select>`; }
+function folioSel(id,cycles,val){
+  const opts=cycles.map(c=>c.folio); if(val && !opts.includes(val)) opts.unshift(val);
+  if(!opts.length) return `<div class="ro">Sin ciclo SIGEM abierto.</div><input id="${id}" type="hidden" value="">`;
+  const cur = val||opts[0];
+  return `<select id="${id}">${opts.map(o=>`<option ${o===cur?"selected":""}>${esc(o)}</option>`).join("")}</select>`;
+}
 
-function eventForm(ev){ const e=ev||{};
+function autoFolio(){
+  let max=0; eqIds().forEach(id=>(HIST[id].eventos||[]).forEach(e=>{
+    const m=/SIGEM-2026-(\d+)/.exec(e.folio||""); if(m) max=Math.max(max,+m[1]); }));
+  return "SIGEM-2026-"+String(max+1).padStart(4,"0");
+}
+function nextEnvio(){
+  let max=0; eqIds().forEach(id=>(HIST[id].eventos||[]).forEach(e=>{
+    if(e.tipo==="Envío a servicio técnico"){ const n=parseInt(e.nEnvio,10); if(!isNaN(n)) max=Math.max(max,n); } }));
+  return max+1;
+}
+
+function eventFields(tipo,e,ctx){
+  const ta=(id,v)=>`<textarea id="${id}" rows="2">${esc(v||"")}</textarea>`;
+  const cyc=()=>folioSel("f_folio",ctx.cycles,e.folio);
+  switch(tipo){
+    case "Solicitud de trabajo":
+      return fLab("Folio SIGEM (vacío = automático)")+fIn("f_folio",e.folio,"SIGEM-2026-####")
+           + fLab("Descripción de la falla")+ta("f_obs",e.obs);
+    case "Visita técnica":
+      return `<div class="frow"><div>${fLab("Empresa")+fIn("f_empresa",e.empresa)}</div><div>${fLab("Técnico")+fIn("f_tecnico",e.tecnico)}</div></div>`
+           + fLab("Tipo de visita")+fSel("f_tvisita",["Diagnóstica","Correctiva"],e.tipoVisita||"Diagnóstica")
+           + fLab("Vincular a Folio SIGEM")+cyc()
+           + fLab("Estado resultante")+fSel("f_estado",["No operativo","Operativo","En servicio técnico"],e.estadoResultante||"No operativo")
+           + fLab("Informe / Observación")+ta("f_obs",e.obs);
+    case "Orden de Compra":
+      return `<div class="frow"><div>${fLab("N° Cotización")+fIn("f_cot",e.nCotizacion)}</div><div>${fLab("N° OC")+fIn("f_oc",e.nOC)}</div></div>`
+           + fLab("Empresa")+fIn("f_empresa",e.empresa)
+           + fLab("Vía")+fSel("f_via",["Trato directo","Compra ágil"],e.via||"Trato directo")
+           + `<div id="wrap_finforme" style="display:${(e.via||"Trato directo")==="Trato directo"?"":"none"}">`+fLab("Folio informe (Trato directo)")+fIn("f_finforme",e.folioInforme)+`</div>`
+           + fLab("Vincular a Folio SIGEM")+cyc()
+           + fLab("Observación")+ta("f_obs",e.obs);
+    case "Envío a servicio técnico":
+      return fLab("N° de envío (vacío = correlativo)")+fIn("f_nenvio",e.nEnvio)
+           + fLab("Empresa")+fIn("f_empresa",e.empresa)
+           + fLab("Vincular a Folio SIGEM")+cyc()
+           + `<div class="ro">Estado resultante: <b>en servicio técnico</b> (fijo)</div>`
+           + fLab("Observación")+ta("f_obs",e.obs);
+    case "Recepción":
+      return fLab("N° envío original")+fIn("f_nenvio",e.nEnvioOriginal)
+           + fLab("Folio guía de despacho")+fIn("f_guia",e.folioGuia)
+           + fLab("Vincular a Folio SIGEM")+cyc()
+           + fLab("Estado resultante")+fSel("f_estado",["No operativo","Operativo"],e.estadoResultante||"Operativo")
+           + fLab("Informe técnico / Observación")+ta("f_obs",e.obs);
+    case "Reparación":
+      return fLab("Repuestos")+ta("f_repuestos",e.repuestos)
+           + fLab("Vincular a Folio SIGEM")+cyc()
+           + fLab("Estado resultante")+fSel("f_estado",["Operativo","No operativo","En servicio técnico"],e.estadoResultante||"Operativo")
+           + fLab("Descripción de la tarea")+ta("f_obs",e.obs);
+    case "Mantención preventiva": {
+      const est0=mpEstado(e.resultado||"Si");
+      return fLab("Ejecutor 2 (opcional)")+fIn("f_ejecutor2",e.ejecutor2)
+           + fLab("Resultado")+fSel("f_resultado",MP_RESULT,e.resultado||"Si")
+           + `<div class="ro">Estado resultante: <b id="mpEst">${est0?esc(est0):"(sin cambio)"}</b> (automático)</div>`
+           + fLab("Observación")+ta("f_obs",e.obs);
+    }
+  }
+  return "";
+}
+
+function eventForm(ev){
+  const isEdit=!!ev; const tipo = isEdit ? ev.tipo : (editing.tipo||ETIPOS[0]);
+  const cycles = openCycles(CURRENT_EQ);
+  let h = `<div class="form">`;
+  h += isEdit ? `<div class="evkv"><b>Tipo:</b> <span class="evtipo">${esc(tipo)}</span></div>`
+              : fLab("Tipo de evento")+fSel("f_tipo",ETIPOS,tipo);
+  h += fLab("Fecha")+fIn("f_fecha",(ev&&ev.fecha)||todayStr(),"","date");
+  h += eventFields(tipo, ev||{}, {cycles});
+  h += `<div class="facts"><button class="btn primary" data-act="save-event" data-ev="${isEdit?ev.id:""}">Guardar</button>`
+     + `<button class="btn" data-act="cancel">Cancelar</button></div></div>`;
+  return h;
+}
+function pendForm(p){ const x=p||{};
   return `<div class="form">
-    <div class="frow">
-      <div><label>Fecha</label><input type="date" id="f_fecha" value="${esc(e.fecha||todayStr())}"></div>
-      <div><label>Tipo</label><select id="f_tipo">${optList(TIPOS_EVENTO, e.tipo||"Observación")}</select></div>
-    </div>
-    <label>¿Qué ocurrió?</label><textarea id="f_desc" rows="2" placeholder="Descripción del evento...">${esc(e.descripcion||"")}</textarea>
-    <div class="facts"><button class="btn primary" data-act="save-event" data-ev="${e.id||""}">Guardar</button>
+    ${fLab("Pendiente")+fIn("f_pt",x.titulo,"Ej: Localizar equipo")}
+    ${fLab("Tipo")+fIn("f_ptipo",x.tipo||"Manual")}
+    <div class="frow"><div>${fLab("Responsable")+fIn("f_presp",x.responsable)}</div><div>${fLab("Fecha límite")+fIn("f_pfl",x.fechaLimite,"","date")}</div></div>
+    ${fLab("Estado")+fSel("f_pest",["abierto","en proceso","cerrado"],x.estado||"abierto")}
+    <div class="facts"><button class="btn primary" data-act="save-pend" data-p="${x.id||""}">Guardar</button>
       <button class="btn" data-act="cancel">Cancelar</button></div></div>`;
 }
-function pendForm(evId,p){ const x=p||{};
+function taskForm(pId,t){ const x=t||{};
   return `<div class="form">
-    <label>Pendiente</label><input id="f_pt" value="${esc(x.titulo||"")}" placeholder="Ej: Reemplazar sensor">
-    <div class="frow">
-      <div><label>Responsable</label><input id="f_presp" value="${esc(x.responsable||"")}"></div>
-      <div><label>Fecha límite</label><input type="date" id="f_pfl" value="${esc(x.fechaLimite||"")}"></div>
-    </div>
-    <label>Estado</label><select id="f_pest">${optList(["abierto","en proceso","cerrado"], x.estado||"abierto")}</select>
-    <div class="facts"><button class="btn primary" data-act="save-pend" data-ev="${evId}" data-p="${x.id||""}">Guardar</button>
+    <div class="frow"><div>${fLab("Tipo")}<select id="f_ttipo"><option value="tarea" ${x.tipo!=="gestion"?"selected":""}>Tarea</option><option value="gestion" ${x.tipo==="gestion"?"selected":""}>Gestión</option></select></div>
+    <div>${fLab("Estado")}<select id="f_test"><option value="pendiente" ${x.estado!=="hecha"?"selected":""}>Pendiente</option><option value="hecha" ${x.estado==="hecha"?"selected":""}>Hecha</option></select></div></div>
+    ${fLab("Descripción")+fIn("f_tdesc",x.descripcion,"Ej: Cotizar repuesto")}
+    ${fLab("Nota (opcional)")+fIn("f_tnota",x.nota)}
+    <div class="facts"><button class="btn primary" data-act="save-task" data-p="${pId}" data-t="${x.id||""}">Guardar</button>
       <button class="btn" data-act="cancel">Cancelar</button></div></div>`;
 }
-function taskForm(evId,pId,t){ const x=t||{};
-  return `<div class="form">
-    <div class="frow">
-      <div><label>Tipo</label><select id="f_ttipo"><option value="tarea" ${x.tipo!=="gestion"?"selected":""}>Tarea</option><option value="gestion" ${x.tipo==="gestion"?"selected":""}>Gestión</option></select></div>
-      <div><label>Estado</label><select id="f_test"><option value="pendiente" ${x.estado!=="hecha"?"selected":""}>Pendiente</option><option value="hecha" ${x.estado==="hecha"?"selected":""}>Hecha</option></select></div>
-    </div>
-    <label>Descripción</label><input id="f_tdesc" value="${esc(x.descripcion||"")}" placeholder="Ej: Cotizar repuesto con proveedor">
-    <label>Nota (opcional)</label><input id="f_tnota" value="${esc(x.nota||"")}">
-    <div class="facts"><button class="btn primary" data-act="save-task" data-ev="${evId}" data-p="${pId}" data-t="${x.id||""}">Guardar</button>
-      <button class="btn" data-act="cancel">Cancelar</button></div></div>`;
+
+function evSummary(e){
+  const kv=[]; const push=(k,v)=>{ if(v) kv.push(`<b>${esc(k)}:</b> ${esc(v)}`); };
+  switch(e.tipo){
+    case "Solicitud de trabajo": push("Falla",e.obs); break;
+    case "Visita técnica": push("Empresa",e.empresa); push("Técnico",e.tecnico); push("Visita",e.tipoVisita); push("Resultado",e.estadoResultante); push("Informe",e.obs); break;
+    case "Orden de Compra": push("N° Cotización",e.nCotizacion); push("N° OC",e.nOC); push("Empresa",e.empresa); push("Vía",e.via); push("Folio informe",e.folioInforme); push("Obs",e.obs); break;
+    case "Envío a servicio técnico": push("N° envío",e.nEnvio); push("Empresa",e.empresa); push("Obs",e.obs); break;
+    case "Recepción": push("N° envío orig.",e.nEnvioOriginal); push("Guía despacho",e.folioGuia); push("Resultado",e.estadoResultante); push("Informe",e.obs); break;
+    case "Reparación": push("Repuestos",e.repuestos); push("Resultado",e.estadoResultante); push("Tarea",e.obs); break;
+    case "Mantención preventiva": push("Resultado",`${e.resultado}${MP_RESULT_TXT[e.resultado]?(" · "+MP_RESULT_TXT[e.resultado]):""}`); push("Ejecutor 2",e.ejecutor2); push("Obs",e.obs); break;
+  }
+  return kv.join("<br>") || "<i>—</i>";
 }
 
 function renderDrawer(){
   const id = CURRENT_EQ; const rec = getHist(id); const info = getEquipoInfo(id);
-  $("#dTitle").textContent = `Equipo #${id}${info.equipo?(" · "+info.equipo):""}`;
+  const red = reduceEquipo(id);
+  $("#dTitle").innerHTML = `Equipo #${esc(id)}${info.equipo?(" · "+esc(info.equipo)):""} <span class="est ${estCls(red.estado)}">${esc(red.estado)}</span>`;
   $("#dSub").innerHTML = [
     info.inv?("N° Inv: "+esc(info.inv)):"", (info.marca||info.modelo)?esc((info.marca||"")+" "+(info.modelo||"")).trim():"",
     info.serie?("Serie: "+esc(info.serie)):"", info.servicio?esc(info.servicio):"", info.ubic?esc(info.ubic):""
   ].filter(Boolean).join(" · ");
 
-  let b = "";
+  const cyc=[...red.open.values()];
+  let b = `<div class="evkv">Ciclos SIGEM abiertos: ${cyc.length?cyc.map(c=>`<span class="folio">${esc(c.folio)}</span>`).join(" "):"<i>ninguno</i>"}</div>`;
+
+  // ---- EVENTOS ----
+  b += `<div class="sec">Eventos</div>`;
   b += (editing && editing.kind==="event" && editing.mode==="add")
-        ? eventForm(null)
-        : `<button class="addbtn" data-act="add-event">＋ Nuevo evento</button>`;
-
-  const evs = (rec.eventos||[]).slice().reverse();   // más reciente primero
-  if(!evs.length && !(editing&&editing.kind==="event"&&editing.mode==="add"))
-    b += `<div class="dhint">Aún no hay eventos registrados para este equipo.</div>`;
-
+        ? eventForm(null) : `<button class="addbtn" data-act="add-event">＋ Nuevo evento</button>`;
+  const evs = (rec.eventos||[]).slice().sort((a,b)=>(b.fecha||"").localeCompare(a.fecha||"")||(b.seq||0)-(a.seq||0));
+  if(!evs.length && !(editing&&editing.kind==="event"&&editing.mode==="add")) b += `<div class="dhint">Sin eventos registrados.</div>`;
   evs.forEach(ev=>{
-    b += `<div class="ev">`;
     if(editing && editing.kind==="event" && editing.mode==="edit" && editing.evId===ev.id){
-      b += eventForm(ev);
-    }else{
-      b += `<div class="evh"><span class="evdate">📅 ${esc(ev.fecha||"")} ${ev.tipo?`· <span class="chip tipoev">${esc(ev.tipo)}</span>`:""}</span>
-        <span><button class="minibtn" data-act="edit-event" data-ev="${ev.id}" title="Editar">✏️</button>
-        <button class="minibtn" data-act="del-event" data-ev="${ev.id}" title="Eliminar">🗑️</button></span></div>
-        <div class="evdesc">${esc(ev.descripcion||"")}</div>`;
+      b += `<div class="ev">${eventForm(ev)}</div>`; return;
     }
-    (ev.pendientes||[]).forEach(p=>{
-      const ovd = p.estado!=="cerrado" && p.fechaLimite && p.fechaLimite < todayStr();
-      b += `<div class="pend${ovd?" ovd":""}">`;
-      if(editing && editing.kind==="pend" && editing.mode==="edit" && editing.pId===p.id){
-        b += pendForm(ev.id, p);
-      }else{
-        b += `<div class="ph"><span class="pt">📌 ${esc(p.titulo||"")}</span>
-          <span>${estadoChip(p.estado)}
-          <button class="minibtn" data-act="edit-pend" data-ev="${ev.id}" data-p="${p.id}" title="Editar">✏️</button>
-          <button class="minibtn" data-act="del-pend" data-ev="${ev.id}" data-p="${p.id}" title="Eliminar">🗑️</button></span></div>
-          <div class="meta">${p.responsable?("👤 "+esc(p.responsable)+" "):""}${p.fechaLimite?("· ⏰ "+esc(p.fechaLimite)+(ovd?" (vencido)":"")):""}</div>`;
-      }
-      (p.tareas||[]).forEach(t=>{
-        if(editing && editing.kind==="task" && editing.mode==="edit" && editing.tId===t.id){
-          b += taskForm(ev.id, p.id, t);
-        }else{
-          b += `<div class="task${t.estado==="hecha"?" done":""}">
-            <input type="checkbox" data-act="toggle-task" data-ev="${ev.id}" data-p="${p.id}" data-t="${t.id}" ${t.estado==="hecha"?"checked":""}>
-            <div class="tdesc">${tipoChip(t.tipo)} ${esc(t.descripcion||"")}${t.nota?`<div class="meta">${esc(t.nota)}</div>`:""}</div>
-            <button class="minibtn" data-act="edit-task" data-ev="${ev.id}" data-p="${p.id}" data-t="${t.id}" title="Editar">✏️</button>
-            <button class="minibtn" data-act="del-task" data-ev="${ev.id}" data-p="${p.id}" data-t="${t.id}" title="Eliminar">🗑️</button></div>`;
-        }
-      });
-      b += (editing && editing.kind==="task" && editing.mode==="add" && editing.pId===p.id)
-            ? taskForm(ev.id, p.id, null)
-            : `<button class="addbtn sub" data-act="add-task" data-ev="${ev.id}" data-p="${p.id}">＋ Tarea / gestión</button>`;
-      b += `</div>`;
+    b += `<div class="ev${ev.anulado?" anul":""}">
+      <div class="evh"><span class="evdate">📅 ${esc(ev.fecha||"")} <span class="evtipo">${esc(ev.tipo)}</span> ${ev.folio?`<span class="folio">${esc(ev.folio)}</span>`:""}</span>
+      <span>${ev.anulado?"":`<button class="minibtn" data-act="edit-event" data-ev="${ev.id}" title="Editar">✏️</button><button class="minibtn" data-act="anul-event" data-ev="${ev.id}" title="Anular">🚫</button>`}</span></div>
+      <div class="evkv">${evSummary(ev)}</div>
+      ${ev.anulado?`<div class="anulmsg">Anulado (${esc(ev.anulFecha||"")}): ${esc(ev.anulMotivo||"")}</div>`:""}</div>`;
+  });
+
+  // ---- PENDIENTES ----
+  b += `<div class="sec">Pendientes</div>`;
+  b += (editing && editing.kind==="pend" && editing.mode==="add")
+        ? pendForm(null) : `<button class="addbtn" data-act="add-pend">＋ Nuevo pendiente</button>`;
+  const pends = (rec.pendientes||[]).filter(p=>!p.anulado);
+  if(!pends.length && !(editing&&editing.kind==="pend"&&editing.mode==="add")) b += `<div class="dhint">Sin pendientes.</div>`;
+  pends.forEach(p=>{
+    const ovd = p.estado!=="cerrado" && p.fechaLimite && p.fechaLimite < todayStr();
+    b += `<div class="pend${ovd?" ovd":""}">`;
+    if(editing && editing.kind==="pend" && editing.mode==="edit" && editing.pId===p.id){ b += pendForm(p); }
+    else{
+      b += `<div class="ph"><span class="pt">📌 ${esc(p.titulo||"")} ${p.auto?`<span class="pauto">auto</span>`:""}</span>
+        <span>${estadoChip(p.estado)} <button class="minibtn" data-act="edit-pend" data-p="${p.id}" title="Editar">✏️</button>
+        <button class="minibtn" data-act="del-pend" data-p="${p.id}" title="Eliminar">🗑️</button></span></div>
+        <div class="meta">${p.tipo?("· "+esc(p.tipo)+" "):""}${p.responsable?("· 👤 "+esc(p.responsable)+" "):""}${p.fechaLimite?("· ⏰ "+esc(p.fechaLimite)+(ovd?" (vencido)":"")):""}${p.folio?(' · <span class="folio">'+esc(p.folio)+"</span>"):""}</div>`;
+    }
+    (p.tareas||[]).forEach(t=>{
+      if(editing && editing.kind==="task" && editing.mode==="edit" && editing.tId===t.id){ b += taskForm(p.id,t); }
+      else b += `<div class="task${t.estado==="hecha"?" done":""}">
+        <input type="checkbox" data-act="toggle-task" data-p="${p.id}" data-t="${t.id}" ${t.estado==="hecha"?"checked":""}>
+        <div class="tdesc">${tipoChip(t.tipo)} ${esc(t.descripcion||"")}${t.nota?`<div class="meta">${esc(t.nota)}</div>`:""}</div>
+        <button class="minibtn" data-act="edit-task" data-p="${p.id}" data-t="${t.id}" title="Editar">✏️</button>
+        <button class="minibtn" data-act="del-task" data-p="${p.id}" data-t="${t.id}" title="Eliminar">🗑️</button></div>`;
     });
-    b += (editing && editing.kind==="pend" && editing.mode==="add" && editing.evId===ev.id)
-          ? pendForm(ev.id, null)
-          : `<button class="addbtn sub" data-act="add-pend" data-ev="${ev.id}">＋ Pendiente</button>`;
+    b += (editing && editing.kind==="task" && editing.mode==="add" && editing.pId===p.id)
+          ? taskForm(p.id,null) : `<button class="addbtn sub" data-act="add-task" data-p="${p.id}">＋ Tarea / gestión</button>`;
     b += `</div>`;
   });
   $("#dBody").innerHTML = b;
 }
 
 function val(id){ const el=document.getElementById(id); return el?el.value.trim():""; }
+
 function saveEvent(evId){
   const rec = ensureEq(CURRENT_EQ);
-  const data = {fecha:val("f_fecha"), tipo:val("f_tipo"), descripcion:val("f_desc")};
-  if(!data.descripcion && !data.fecha){ editing=null; return renderDrawer(); }
-  if(evId){ Object.assign(rec.eventos.find(x=>x.id===evId), data); }
-  else { rec.eventos.push({id:uid(), ...data, pendientes:[]}); }
-  editing=null; saveHist(); renderDrawer();
+  const existing = evId ? rec.eventos.find(x=>x.id===evId) : null;
+  const tipo = existing ? existing.tipo : editing.tipo;
+  const fecha = val("f_fecha");
+  if(!fecha){ alert("Indica la fecha del evento."); return; }
+  const cycles = openCycles(CURRENT_EQ);
+  const data = {fecha, tipo, obs:val("f_obs")};
+  if(tipo==="Solicitud de trabajo"){ data.folio = val("f_folio") || autoFolio(); }
+  else if(tipo==="Visita técnica"){ data.empresa=val("f_empresa"); data.tecnico=val("f_tecnico"); data.tipoVisita=val("f_tvisita"); data.folio=val("f_folio"); data.estadoResultante=val("f_estado"); }
+  else if(tipo==="Orden de Compra"){ data.nCotizacion=val("f_cot"); data.nOC=val("f_oc"); data.empresa=val("f_empresa"); data.via=val("f_via"); data.folioInforme=(data.via==="Trato directo")?val("f_finforme"):""; data.folio=val("f_folio"); }
+  else if(tipo==="Envío a servicio técnico"){ data.nEnvio=val("f_nenvio")||String(nextEnvio()); data.empresa=val("f_empresa"); data.folio=val("f_folio"); }
+  else if(tipo==="Recepción"){ data.nEnvioOriginal=val("f_nenvio"); data.folioGuia=val("f_guia"); data.folio=val("f_folio"); data.estadoResultante=val("f_estado");
+      if(!cycles.length && !confirm("Este equipo no tiene un ciclo SIGEM abierto. ¿Registrar la recepción de todos modos?")) return; }
+  else if(tipo==="Reparación"){ data.repuestos=val("f_repuestos"); data.folio=val("f_folio"); data.estadoResultante=val("f_estado");
+      if(!cycles.length && !confirm("Este equipo no tiene un ciclo SIGEM abierto. ¿Registrar la reparación de todos modos?")) return; }
+  else if(tipo==="Mantención preventiva"){ data.ejecutor2=val("f_ejecutor2"); data.resultado=val("f_resultado"); }
+
+  let theId;
+  if(existing){ theId=existing.id; Object.assign(existing, data); }
+  else { theId=uid(); rec.eventos.push({id:theId, seq:Date.now(), origen:"manual", anulado:false, ...data}); }
+
+  // pendientes automáticos de la MP (se regeneran)
+  rec.pendientes = rec.pendientes.filter(p=>!(p.auto && p.originEvId===theId));
+  if(tipo==="Mantención preventiva"){
+    const code=data.resultado;
+    if(/^C[1-8]$/.test(code)){
+      const mes=MESES_AB[(monthIdx(fecha)+1)%12];
+      rec.pendientes.push({id:uid(),auto:true,originEvId:theId,tipo:"Reprogramación",titulo:`Reprogramar MP (${code}) → ${mes}`,estado:"abierto",responsable:"",fechaLimite:"",folio:"",tareas:[]});
+    }else if(code==="NU"){
+      rec.pendientes.push({id:uid(),auto:true,originEvId:theId,tipo:"Localización",titulo:"Localizar equipo",estado:"abierto",responsable:"",fechaLimite:"",folio:"",tareas:[]});
+    }
+  }
+  editing=null; saveHist();
 }
-function savePend(evId,pId){
-  const ev = ensureEq(CURRENT_EQ).eventos.find(x=>x.id===evId); if(!ev) return;
-  const data = {titulo:val("f_pt"), responsable:val("f_presp"), fechaLimite:val("f_pfl"), estado:val("f_pest")};
+function anularEvento(evId){
+  const motivo = prompt("Motivo de la anulación:"); if(motivo===null) return;
+  const rec = ensureEq(CURRENT_EQ); const ev = rec.eventos.find(x=>x.id===evId); if(!ev) return;
+  ev.anulado=true; ev.anulFecha=todayStr(); ev.anulMotivo=motivo||"";
+  rec.pendientes = rec.pendientes.filter(p=>!(p.auto && p.originEvId===evId));  // revierte auto-pendientes
+  editing=null; saveHist();
+}
+function savePend(pId){
+  const rec = ensureEq(CURRENT_EQ);
+  const data = {titulo:val("f_pt"), tipo:val("f_ptipo")||"Manual", responsable:val("f_presp"), fechaLimite:val("f_pfl"), estado:val("f_pest")};
   if(!data.titulo){ editing=null; return renderDrawer(); }
-  if(pId){ Object.assign(ev.pendientes.find(x=>x.id===pId), data); }
-  else { (ev.pendientes=ev.pendientes||[]).push({id:uid(), ...data, tareas:[]}); }
-  editing=null; saveHist(); renderDrawer();
+  if(pId){ Object.assign(rec.pendientes.find(x=>x.id===pId), data); }
+  else { rec.pendientes.push({id:uid(), ...data, auto:false, folio:"", tareas:[]}); }
+  editing=null; saveHist();
 }
-function saveTask(evId,pId,tId){
-  const ev = ensureEq(CURRENT_EQ).eventos.find(x=>x.id===evId); if(!ev) return;
-  const p = ev.pendientes.find(x=>x.id===pId); if(!p) return;
+function saveTask(pId,tId){
+  const p = ensureEq(CURRENT_EQ).pendientes.find(x=>x.id===pId); if(!p) return;
   const data = {tipo:val("f_ttipo"), estado:val("f_test"), descripcion:val("f_tdesc"), nota:val("f_tnota")};
   if(!data.descripcion){ editing=null; return renderDrawer(); }
-  if(tId){ Object.assign(p.tareas.find(x=>x.id===tId), data); }
-  else { (p.tareas=p.tareas||[]).push({id:uid(), ...data}); }
-  editing=null; saveHist(); renderDrawer();
+  p.tareas = p.tareas||[];
+  if(tId){ Object.assign(p.tareas.find(x=>x.id===tId), data); } else { p.tareas.push({id:uid(), ...data}); }
+  editing=null; saveHist();
 }
 
 const dBody = $("#dBody");
@@ -790,28 +992,28 @@ dBody.addEventListener("click", e=>{
   const b = e.target.closest("[data-act]"); if(!b) return;
   const {act, ev:evId, p:pId, t:tId} = b.dataset;
   if(act==="cancel"){ editing=null; return renderDrawer(); }
-  if(act==="add-event"){ editing={kind:"event",mode:"add"}; return renderDrawer(); }
+  if(act==="add-event"){ editing={kind:"event",mode:"add",tipo:ETIPOS[0]}; return renderDrawer(); }
   if(act==="edit-event"){ editing={kind:"event",mode:"edit",evId}; return renderDrawer(); }
   if(act==="save-event"){ return saveEvent(evId); }
-  if(act==="del-event"){ if(confirm("¿Eliminar este evento y todo su contenido?")){
-      const rec=ensureEq(CURRENT_EQ); rec.eventos=rec.eventos.filter(x=>x.id!==evId); editing=null; saveHist(); renderDrawer(); } return; }
-  if(act==="add-pend"){ editing={kind:"pend",mode:"add",evId}; return renderDrawer(); }
-  if(act==="edit-pend"){ editing={kind:"pend",mode:"edit",evId,pId}; return renderDrawer(); }
-  if(act==="save-pend"){ return savePend(evId,pId); }
-  if(act==="del-pend"){ if(confirm("¿Eliminar este pendiente y sus tareas?")){
-      const ev=ensureEq(CURRENT_EQ).eventos.find(x=>x.id===evId); ev.pendientes=ev.pendientes.filter(x=>x.id!==pId); editing=null; saveHist(); renderDrawer(); } return; }
-  if(act==="add-task"){ editing={kind:"task",mode:"add",evId,pId}; return renderDrawer(); }
-  if(act==="edit-task"){ editing={kind:"task",mode:"edit",evId,pId,tId}; return renderDrawer(); }
-  if(act==="save-task"){ return saveTask(evId,pId,tId); }
-  if(act==="del-task"){ const ev=ensureEq(CURRENT_EQ).eventos.find(x=>x.id===evId);
-      const p=ev.pendientes.find(x=>x.id===pId); p.tareas=p.tareas.filter(x=>x.id!==tId); editing=null; saveHist(); renderDrawer(); return; }
+  if(act==="anul-event"){ return anularEvento(evId); }
+  if(act==="add-pend"){ editing={kind:"pend",mode:"add"}; return renderDrawer(); }
+  if(act==="edit-pend"){ editing={kind:"pend",mode:"edit",pId}; return renderDrawer(); }
+  if(act==="save-pend"){ return savePend(pId); }
+  if(act==="del-pend"){ if(confirm("¿Eliminar este pendiente?")){ const rec=ensureEq(CURRENT_EQ); rec.pendientes=rec.pendientes.filter(x=>x.id!==pId); editing=null; saveHist(); } return; }
+  if(act==="add-task"){ editing={kind:"task",mode:"add",pId}; return renderDrawer(); }
+  if(act==="edit-task"){ editing={kind:"task",mode:"edit",pId,tId}; return renderDrawer(); }
+  if(act==="save-task"){ return saveTask(pId,tId); }
+  if(act==="del-task"){ const p=ensureEq(CURRENT_EQ).pendientes.find(x=>x.id===pId); p.tareas=p.tareas.filter(x=>x.id!==tId); editing=null; saveHist(); return; }
 });
 dBody.addEventListener("change", e=>{
-  const c = e.target.closest('[data-act="toggle-task"]'); if(!c) return;
-  const ev = ensureEq(CURRENT_EQ).eventos.find(x=>x.id===c.dataset.ev);
-  const p = ev.pendientes.find(x=>x.id===c.dataset.p);
-  const t = p.tareas.find(x=>x.id===c.dataset.t);
-  t.estado = c.checked ? "hecha" : "pendiente"; saveHist(); renderDrawer();
+  const t = e.target;
+  if(t.id==="f_tipo" && editing && editing.kind==="event" && editing.mode==="add"){ editing.tipo=t.value; return renderDrawer(); }
+  if(t.id==="f_resultado"){ const sp=document.getElementById("mpEst"); if(sp){ const ne=mpEstado(t.value); sp.textContent= ne?ne:"(sin cambio)"; } return; }
+  if(t.id==="f_via"){ const w=document.getElementById("wrap_finforme"); if(w) w.style.display=(t.value==="Trato directo")?"":"none"; return; }
+  const c = t.closest('[data-act="toggle-task"]'); if(!c) return;
+  const p = ensureEq(CURRENT_EQ).pendientes.find(x=>x.id===c.dataset.p);
+  const tk = p.tareas.find(x=>x.id===c.dataset.t);
+  tk.estado = c.checked ? "hecha" : "pendiente"; saveHist();
 });
 $("#dClose").addEventListener("click", closeDrawer);
 $("#overlay").addEventListener("click", closeDrawer);
@@ -832,9 +1034,9 @@ $("#impFile").addEventListener("change", e=>{
       const obj = JSON.parse(r.result);
       if(typeof obj!=="object" || Array.isArray(obj)) throw 0;
       if(confirm("¿Reemplazar el historial actual por el del archivo? (Respalda antes con «⬇ Historial» si lo necesitas.)")){
-        HIST = obj; saveHist();
-        if(CURRENT_EQ) renderDrawer();
-        renderTable();
+        HIST = obj;
+        eqIds().forEach(id=>{ HIST[id].eventos=HIST[id].eventos||[]; HIST[id].pendientes=HIST[id].pendientes||[]; });
+        saveHist();
       }
     }catch(err){ alert("El archivo no es un respaldo JSON válido."); }
     finally{ e.target.value = ""; }
